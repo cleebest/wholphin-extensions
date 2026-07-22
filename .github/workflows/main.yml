@@ -33,7 +33,7 @@ jobs:
         with:
           fetch-depth: 0 # Need the tags to build
       - name: Setup
-        uses: damontecres/wholphin/.github/actions/setup@main
+        uses: cleebest/Wholphin/.github/actions/setup@main
 
       - name: Load media3 module cache
         id: cache_media3_module

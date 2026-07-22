@@ -75,7 +75,7 @@ val gitDescribe: String =
 publishing {
     publications {
         create<MavenPublication>("maven") {
-            groupId = "com.github.damontecres.wholphin.mpv"
+            groupId = "com.github.cleebest.wholphin.mpv"
             artifactId = "wholphin-mpv"
             version = gitDescribe
 
@@ -87,7 +87,7 @@ publishing {
     repositories {
         maven {
             name = "GitHubPackages"
-            url = URI("https://maven.pkg.github.com/damontecres/wholphin-extensions")
+            url = URI("https://maven.pkg.github.com/cleebest/wholphin-extensions")
             credentials {
                 username = System.getenv("GITHUB_ACTOR")
                 password = System.getenv("GITHUB_TOKEN")
