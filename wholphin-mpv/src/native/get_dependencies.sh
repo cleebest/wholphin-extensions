@@ -34,6 +34,7 @@ clone "https://github.com/libass/libass" "0.17.4" libass
 
 clone "https://github.com/haasn/libplacebo" "v7.351.0" libplacebo --recurse-submodules
 
+# Use cleebest/mpv with DOVI colorspace injection fixes
 clone "https://github.com/cleebest/mpv" "master" mpv
 
 if [[ ! -d mbedtls ]]; then
