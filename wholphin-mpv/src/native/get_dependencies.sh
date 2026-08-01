@@ -60,7 +60,7 @@ clone "https://github.com/libass/libass" "0.17.4" libass
 
 clone "https://github.com/haasn/libplacebo" "v7.351.0" libplacebo --recurse-submodules
 
-clone "https://github.com/mpv-player/mpv" "v0.41.0" mpv
+clone "${MPV_REPO_URL:-https://github.com/cleebest/mpv}" "${MPV_REPO_BRANCH:-wholphin-dovi}" mpv
 # Apply local patches for Dolby Vision (mediacodec-copy + gpu-next).
 apply_patches mpv 'mpv-*.patch'
 

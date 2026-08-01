@@ -21,3 +21,6 @@ local.properties
 /wholphin-media3/libs/
 ffmpeg_decoder/
 *.pom.xml
+
+# native dependency clones & build artifacts
+wholphin-mpv/src/native/build/
