@@ -2,10 +2,11 @@
 
 set -exou pipefail
 
-SCRIPT_PATH="$(cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd)"
-DEPS_PATH="$SCRIPT_PATH/build/libmpv/deps"
+SCRIPT_PATH="$( dirname "${BASH_SOURCE[0]}" )"
+SCRIPT_DIR_ABS="$(cd "$SCRIPT_PATH" && pwd)"
+DEPS_PATH="../../$SCRIPT_PATH/build/libmpv/deps"
 mkdir -p "$DEPS_PATH"
-DEPS_PATH="$(realpath "$SCRIPT_PATH/build/libmpv/deps")"
+DEPS_PATH="$(realpath ../../$SCRIPT_PATH/build/libmpv/deps)"
 
 pushd "$DEPS_PATH" || exit
 
@@ -28,7 +29,7 @@ function apply_patches(){
   local dir=$1
   local pattern=$2
   local patch_dir
-  patch_dir="$(realpath "$SCRIPT_PATH/patches")"
+  patch_dir="$SCRIPT_DIR_ABS/patches"
   if [[ ! -d "$patch_dir" ]]; then
     return
   fi
