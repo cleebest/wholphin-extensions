@@ -39,3 +39,7 @@ Vision certified, while keeping hardware decoding:
 
 `get_dependencies.sh` applies these patches automatically after cloning FFmpeg
 (n8.0) and mpv (v0.41.0). The patches are idempotent (safe to re-run).
+
+The mpv source is pulled from the `cleebest/mpv` fork (branch `wholphin-dovi`)
+by default. Override with the `MPV_REPO_URL` and `MPV_REPO_BRANCH` environment
+variables if you want to build against upstream mpv or another fork.
