@@ -1,0 +1,185 @@
+diff --git a/player/playloop.c b/player/playloop.c
+index d899fba..1412a6a 100644
+--- a/player/playloop.c
++++ b/player/playloop.c
+@@ -1055,7 +1055,7 @@ int handle_force_window(struct MPContext *mpctx, bool force)
+             .wakeup_cb = mp_wakeup_core_cb,
+             .wakeup_ctx = mpctx,
+         };
+-        mpctx->video_out = init_best_video_out(mpctx->global, &ex);
++        mpctx->video_out = init_best_video_out(mpctx->global, &ex, NULL);
+         if (!mpctx->video_out)
+             goto err;
+         mpctx->mouse_cursor_visible = true;
+diff --git a/player/video.c b/player/video.c
+index e2cc480..7c1a7a3 100644
+--- a/player/video.c
++++ b/player/video.c
+@@ -236,7 +236,34 @@ void reinit_video_chain_src(struct MPContext *mpctx, struct track *track)
+             .wakeup_cb = mp_wakeup_core_cb,
+             .wakeup_ctx = mpctx,
+         };
+-        mpctx->video_out = init_best_video_out(mpctx->global, &ex);
++        const char *force_vo = NULL;
++        if (track && track->stream && track->stream->codec->dovi) {
++            // Dolby Vision needs libplacebo's DV shader, which only the
++            // gpu-next VO supports.
++            force_vo = "gpu-next";
++            MP_INFO(mpctx, "Dolby Vision stream: forcing vo=gpu-next.\n");
++        }
++        mpctx->video_out = init_best_video_out(mpctx->global, &ex, force_vo);
++        if (!mpctx->video_out) {
++            MP_FATAL(mpctx, "Error opening/initializing "
++                    "the selected video_out (--vo) device.\n");
++            mpctx->error_playing = MPV_ERROR_VO_INIT_FAILED;
++            goto err_out;
++        }
++        mpctx->mouse_cursor_visible = true;
++    } else if (track && track->stream && track->stream->codec->dovi &&
++               strcmp(mpctx->video_out->driver->name, "gpu-next") != 0) {
++        // The VO persists across files; recreate it with gpu-next for DV.
++        MP_INFO(mpctx, "Dolby Vision stream: recreating VO with gpu-next.\n");
++        uninit_video_out(mpctx);
++        struct vo_extra ex = {
++            .input_ctx = mpctx->input,
++            .osd = mpctx->osd,
++            .encode_lavc_ctx = mpctx->encode_lavc_ctx,
++            .wakeup_cb = mp_wakeup_core_cb,
++            .wakeup_ctx = mpctx,
++        };
++        mpctx->video_out = init_best_video_out(mpctx->global, &ex, "gpu-next");
+         if (!mpctx->video_out) {
+             MP_FATAL(mpctx, "Error opening/initializing "
+                     "the selected video_out (--vo) device.\n");
+diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
+index ae199c6..af8603c 100644
+--- a/video/decode/vd_lavc.c
++++ b/video/decode/vd_lavc.c
+@@ -511,10 +511,12 @@ static void select_and_set_hwdec(struct mp_filter *vd)
+     add_all_hwdec_methods(&hwdecs, &num_hwdecs);
+ 
+     char **hwdec_api = ctx->hwdec_opts->hwdec_api;
++    bool hwdec_attempted = false;
+     for (int i = 0; hwdec_api && hwdec_api[i]; i++) {
+         bstr opt = bstr0(hwdec_api[i]);
+ 
+         bool hwdec_requested = !bstr_equals0(opt, "no");
++        hwdec_attempted |= hwdec_requested;
+         bool hwdec_auto_safe = bstr_equals0(opt, "auto") ||
+                             bstr_equals0(opt, "auto-safe") ||
+                             bstr_equals0(opt, "auto-copy") ||
+@@ -545,6 +547,35 @@ static void select_and_set_hwdec(struct mp_filter *vd)
+                 if (!hwdec_auto && !(bstr_equals0(opt, hwdec->method_name) ||
+                                     bstr_equals0(opt, hwdec->name)))
+                     continue;
++
++                /*
++                 * Dolby Vision: the Surface-based mediacodec output is turned
++                 * into RGB by the driver before mpv can color-manage it, so the
++                 * Dolby Vision shader (which needs the raw IPTPQc2-coded
++                 * planes) can never work on it. Redirect to the -copy variant:
++                 * decoding is still done by the hardware codec, but we receive
++                 * the raw planes in system memory.
++                 */
++                if (ctx->codec->dovi && !hwdec->copying &&
++                    strcmp(hwdec->method_name, "mediacodec") == 0)
++                {
++                    struct hwdec_info *copy = NULL;
++                    for (int k = 0; k < num_hwdecs; k++) {
++                        if (hwdecs[k].copying &&
++                            hwdecs[k].codec->id == hwdec->codec->id &&
++                            strcmp(hwdecs[k].method_name, "mediacodec-copy") == 0)
++                        {
++                            copy = &hwdecs[k];
++                            break;
++                        }
++                    }
++                    if (copy) {
++                        MP_INFO(vd, "Dolby Vision stream: forcing %s so the "
++                                "Dolby Vision shader gets the raw samples.\n",
++                                copy->method_name);
++                        hwdec = copy;
++                    }
++                }
+                 hwdec_name_supported = true;
+ 
+                 bool already_attempted = false;
+@@ -646,6 +677,10 @@ static void select_and_set_hwdec(struct mp_filter *vd)
+             MP_WARN(ctx, "Software decoding fallback is disabled.\n");
+             ctx->force_eof = true;
+         } else {
++            if (hwdec_attempted && ctx->codec->dovi)
++                MP_WARN(vd, "Dolby Vision stream: hardware decoding unavailable, "
++                        "using software decoding (colors stay correct, performance "
++                        "is lower).\n");
+             MP_VERBOSE(vd, "Using software decoding.\n");
+         }
+     }
+diff --git a/video/out/gpu/video.c b/video/out/gpu/video.c
+index 656c11c..cae56e4 100644
+--- a/video/out/gpu/video.c
++++ b/video/out/gpu/video.c
+@@ -276,6 +276,7 @@ struct gl_video {
+     bool dsi_warned;
+     bool broken_frame; // temporary error state
+ 
++    bool dovi_warned;
+     bool colorspace_override_warned;
+     bool correct_downscaling_warned;
+ };
+@@ -4271,6 +4272,14 @@ void gl_video_config(struct gl_video *p, struct mp_image_params *params)
+     unmap_overlay(p);
+     unref_current_image(p);
+ 
++    if (!p->dovi_warned &&
++        (params->repr.dovi || params->repr.sys == PL_COLOR_SYSTEM_DOLBYVISION))
++    {
++        p->dovi_warned = true;
++        MP_WARN(p, "Dolby Vision content detected, but this VO (gpu) cannot render "
++                   "it correctly; use vo=gpu-next for Dolby Vision playback.\n");
++    }
++
+     if (!mp_image_params_static_equal(&p->real_image_params, params)) {
+         uninit_video(p);
+         p->real_image_params = *params;
+diff --git a/video/out/vo.c b/video/out/vo.c
+index f93f6cf..6f9bac2 100644
+--- a/video/out/vo.c
++++ b/video/out/vo.c
+@@ -328,11 +328,21 @@ error:
+     return NULL;
+ }
+ 
+-struct vo *init_best_video_out(struct mpv_global *global, struct vo_extra *ex)
++struct vo *init_best_video_out(struct mpv_global *global, struct vo_extra *ex,
++                               const char *force_driver)
+ {
+     struct mp_vo_opts *opts = mp_get_config_group(NULL, global, &vo_sub_opts);
+     struct m_obj_settings *vo_list = opts->video_driver_list;
+     struct vo *vo = NULL;
++    // If a driver is forced (e.g. Dolby Vision needs the libplacebo VO), try
++    // it first and only fall back to the configured list on failure.
++    if (force_driver) {
++        vo = vo_create(true, global, ex, (char *)force_driver);
++        if (vo)
++            goto done;
++        mp_warn(mp_null_log, "Forced video output driver '%s' failed; falling back.\n",
++                force_driver);
++    }
+     // first try the preferred drivers, with their optional subdevice param:
+     if (vo_list && vo_list[0].name) {
+         for (int n = 0; vo_list[n].name; n++) {
+diff --git a/video/out/vo.h b/video/out/vo.h
+index f24918d..1491190 100644
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -523,7 +523,8 @@ struct vo {
+ };
+ 
+ struct mpv_global;
+-struct vo *init_best_video_out(struct mpv_global *global, struct vo_extra *ex);
++struct vo *init_best_video_out(struct mpv_global *global, struct vo_extra *ex,
++                               const char *force_driver);
+ int vo_reconfig(struct vo *vo, struct mp_image_params *p);
+ int vo_reconfig2(struct vo *vo, struct mp_image *img);
+ 

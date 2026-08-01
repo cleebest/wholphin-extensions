@@ -1,0 +1,165 @@
+diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
+index 9b91c8e..4d19d3a 100644
+--- a/libavcodec/mediacodecdec_common.c
++++ b/libavcodec/mediacodecdec_common.c
+@@ -35,6 +35,9 @@
+ 
+ #include "avcodec.h"
+ #include "decode.h"
++#include "dovi_rpu.h"
++#include "h2645_parse.h"
++#include "hevc/hevc.h"
+ 
+ #include "mediacodec.h"
+ #include "mediacodec_surface.h"
+@@ -192,6 +195,7 @@ enum {
+     COLOR_FormatYUV420Planar                              = 0x13,
+     COLOR_FormatYUV420SemiPlanar                          = 0x15,
+     COLOR_FormatYCbYCr                                    = 0x19,
++    COLOR_FormatYUV420Flexible                            = 0x7F420888,
+     COLOR_FormatAndroidOpaque                             = 0x7F000789,
+     COLOR_QCOM_FormatYUV420SemiPlanar                     = 0x7fa30c00,
+     COLOR_QCOM_FormatYUV420SemiPlanar32m                  = 0x7fa30c04,
+@@ -209,6 +213,10 @@ static const struct {
+ 
+     { COLOR_FormatYUV420Planar,                              AV_PIX_FMT_YUV420P },
+     { COLOR_FormatYUV420SemiPlanar,                          AV_PIX_FMT_NV12    },
++    /* Without a Surface, decoders that only advertise the flexible format
++     * still emit a plain NV12 layout in practice (same as ExoPlayer's
++     * handling), so map it to the semi-planar copier. */
++    { COLOR_FormatYUV420Flexible,                            AV_PIX_FMT_NV12    },
+     { COLOR_QCOM_FormatYUV420SemiPlanar,                     AV_PIX_FMT_NV12    },
+     { COLOR_QCOM_FormatYUV420SemiPlanar32m,                  AV_PIX_FMT_NV12    },
+     { COLOR_QCOM_FormatYUV420PackedSemiPlanar64x32Tile2m8ka, AV_PIX_FMT_NV12    },
+@@ -255,6 +263,11 @@ static void ff_mediacodec_dec_unref(MediaCodecDecContext *s)
+         return;
+ 
+     if (atomic_fetch_sub(&s->refcount, 1) == 1) {
++        if (s->dovi_parsing) {
++            ff_dovi_ctx_unref(&s->dovi_ctx);
++            ff_h2645_packet_uninit(&s->dovi_pkt);
++        }
++
+         if (s->codec) {
+             ff_AMediaCodec_delete(s->codec);
+             s->codec = NULL;
+@@ -356,6 +369,9 @@ static int mediacodec_wrap_hw_buffer(AVCodecContext *avctx,
+             "Wrapping output buffer %zd (%p) ts=%"PRId64" [%d pending]\n",
+             buffer->index, buffer, buffer->pts, atomic_load(&s->hw_buffer_count));
+ 
++    if (s->dovi_parsing)
++        ff_dovi_attach_side_data(&s->dovi_ctx, frame);
++
+     return 0;
+ fail:
+     av_freep(&buffer);
+@@ -490,6 +506,7 @@ static int mediacodec_wrap_sw_video_buffer(AVCodecContext *avctx,
+         ff_mediacodec_sw_buffer_copy_yuv420_planar(avctx, s, data, size, info, frame);
+         break;
+     case COLOR_FormatYUV420SemiPlanar:
++    case COLOR_FormatYUV420Flexible:
+     case COLOR_QCOM_FormatYUV420SemiPlanar:
+     case COLOR_QCOM_FormatYUV420SemiPlanar32m:
+         ff_mediacodec_sw_buffer_copy_yuv420_semi_planar(avctx, s, data, size, info, frame);
+@@ -508,6 +525,9 @@ static int mediacodec_wrap_sw_video_buffer(AVCodecContext *avctx,
+         goto done;
+     }
+ 
++    if (s->dovi_parsing)
++        ff_dovi_attach_side_data(&s->dovi_ctx, frame);
++
+     ret = 0;
+ done:
+     status = ff_AMediaCodec_releaseOutputBuffer(s->codec, index, 0);
+@@ -729,6 +749,9 @@ static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContex
+     atomic_init(&s->hw_buffer_count, 0);
+     s->current_input_buffer = -1;
+ 
++    if (s->dovi_parsing)
++        ff_dovi_ctx_flush(&s->dovi_ctx);
++
+     status = ff_AMediaCodec_flush(codec);
+     if (status < 0) {
+         av_log(avctx, AV_LOG_ERROR, "Failed to flush codec\n");
+@@ -836,6 +859,15 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
+     atomic_init(&s->serial, 1);
+     s->current_input_buffer = -1;
+ 
++    if (avctx->codec_id == AV_CODEC_ID_HEVC) {
++        s->dovi_parsing = 1;
++        s->dovi_ctx.logctx = avctx;
++        const AVPacketSideData *csd = ff_get_coded_side_data(avctx,
++                                                             AV_PKT_DATA_DOVI_CONF);
++        if (csd && csd->size >= sizeof(s->dovi_ctx.cfg))
++            s->dovi_ctx.cfg = *(const AVDOVIDecoderConfigurationRecord *)csd->data;
++    }
++
+     if (avctx->codec_type == AVMEDIA_TYPE_AUDIO)
+         ret = mediacodec_dec_get_audio_codec(avctx, s, mime, format);
+     else if (avctx->codec_type == AVMEDIA_TYPE_VIDEO)
+@@ -911,6 +943,38 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
+         need_draining = 1;
+     }
+ 
++    /* Parse the Dolby Vision RPU out of the HEVC access unit. The wrapper
++     * decoder itself never looks at the bitstream, so this is the only place
++     * where the metadata can be recovered for the output frames. */
++    if (s->dovi_parsing && pkt->size > 0) {
++        int sd_size = 0;
++        const uint8_t *sd = av_packet_get_side_data(pkt, AV_PKT_DATA_DOVI_CONF,
++                                                    &sd_size);
++        if (sd && sd_size >= sizeof(s->dovi_ctx.cfg))
++            s->dovi_ctx.cfg = *(const AVDOVIDecoderConfigurationRecord *)sd;
++
++        int ret = ff_h2645_packet_split(&s->dovi_pkt, pkt->data, pkt->size,
++                                        avctx, 0, avctx->codec_id, 0);
++        if (ret >= 0) {
++            if (s->dovi_pkt.nb_nals > 1) {
++                const H2645NAL *nal = &s->dovi_pkt.nals[s->dovi_pkt.nb_nals - 1];
++                /* Dolby Vision RPUs masquerade as unregistered NAL type 62
++                 * and are appended to the end of the access unit. */
++                if (nal->type == HEVC_NAL_UNSPEC62 && nal->size > 2 &&
++                    !nal->nuh_layer_id && !nal->temporal_id)
++                {
++                    ret = ff_dovi_rpu_parse(&s->dovi_ctx, nal->data + 2,
++                                            nal->size - 2,
++                                            avctx->err_recognition);
++                    if (ret < 0)
++                        av_log(avctx, AV_LOG_WARNING,
++                               "Error parsing DOVI NAL unit.\n");
++                }
++            }
++            ff_h2645_packet_uninit(&s->dovi_pkt);
++        }
++    }
++
+     if (s->draining && s->eos) {
+         return AVERROR_EOF;
+     }
+diff --git a/libavcodec/mediacodecdec_common.h b/libavcodec/mediacodecdec_common.h
+index 0ab2903..4c39112 100644
+--- a/libavcodec/mediacodecdec_common.h
++++ b/libavcodec/mediacodecdec_common.h
+@@ -32,6 +32,8 @@
+ #include "libavutil/pixfmt.h"
+ 
+ #include "avcodec.h"
++#include "dovi_rpu.h"
++#include "h2645_parse.h"
+ #include "mediacodec_wrapper.h"
+ 
+ typedef struct MediaCodecDecContext {
+@@ -71,6 +73,13 @@ typedef struct MediaCodecDecContext {
+     atomic_int serial;
+ 
+     bool use_ndk_codec;
++
++    /* Dolby Vision (HEVC only): the MediaCodec wrapper decoders do not parse
++     * the bitstream, so the RPU (NAL type 62) has to be extracted and decoded
++     * here to provide AV_FRAME_DATA_DOVI_METADATA on the output frames. */
++    DOVIContext dovi_ctx;
++    H2645Packet dovi_pkt;
++    bool dovi_parsing;
+ } MediaCodecDecContext;
+ 
+ int ff_mediacodec_dec_init(AVCodecContext *avctx,

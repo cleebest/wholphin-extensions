@@ -22,3 +22,20 @@ PATH="$PATH:$NDK_PATH/toolchains/llvm/prebuilt/darwin-x86_64/bin" ./buildall.sh 
 cd ../../.. # ie $PROJECT_ROOT
 ./gradlew build
 ```
+
+### Dolby Vision P5 on non-certified devices
+
+`wholphin-mpv/src/native/patches/` contains two patches that make Dolby Vision
+Profile 5 playback show correct colors on devices whose chips are not Dolby
+Vision certified, while keeping hardware decoding:
+
+- `ffmpeg-mediacodec-dovi.patch`: makes FFmpeg's `hevc_mediacodec` wrapper parse
+  the Dolby Vision RPU (NAL type 62) and attach `AV_FRAME_DATA_DOVI_METADATA` to
+  the output frames, and adds `COLOR_FormatYUV420Flexible` support so the
+  no-Surface byte-buffer path works on more devices.
+- `mpv-dovi.patch`: forces `mediacodec-copy` (raw IPTPQc2 samples) and
+  `vo=gpu-next` (libplacebo DV shader) for Dolby Vision streams, with clear
+  fallback warnings when hardware decode or gpu-next is unavailable.
+
+`get_dependencies.sh` applies these patches automatically after cloning FFmpeg
+(n8.0) and mpv (v0.41.0). The patches are idempotent (safe to re-run).
