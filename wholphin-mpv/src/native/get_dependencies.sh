@@ -18,10 +18,11 @@ function clone(){
 
   if [[ -d "$dir" ]]; then
     pushd "$dir" || exit
-    git checkout --force "$branch"
+    git checkout --force "$branch" 2>/dev/null || \
+      git checkout --force "refs/tags/$branch" 2>/dev/null || true
     popd || exit
   else
-    git clone "$repo" --depth 1 --single-branch -b "$branch" "$dir" "$@"
+    git clone "$repo" --depth 1 -b "$branch" "$dir" "$@"
   fi
 }
 
@@ -51,7 +52,7 @@ function apply_patches(){
 
 clone "https://github.com/videolan/dav1d" "1.5.3" dav1d
 
-clone "https://github.com/FFmpeg/FFmpeg" "n8.0" ffmpeg
+clone "https://github.com/FFmpeg/FFmpeg" "n8.1.2" ffmpeg
 # Apply local patches for Dolby Vision support in the MediaCodec wrapper.
 apply_patches ffmpeg 'ffmpeg-*.patch'
 

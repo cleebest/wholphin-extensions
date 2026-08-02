@@ -51,70 +51,6 @@ index e2cc480..7c1a7a3 100644
          if (!mpctx->video_out) {
              MP_FATAL(mpctx, "Error opening/initializing "
                      "the selected video_out (--vo) device.\n");
-diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
-index ae199c6..af8603c 100644
---- a/video/decode/vd_lavc.c
-+++ b/video/decode/vd_lavc.c
-@@ -511,10 +511,12 @@ static void select_and_set_hwdec(struct mp_filter *vd)
-     add_all_hwdec_methods(&hwdecs, &num_hwdecs);
- 
-     char **hwdec_api = ctx->hwdec_opts->hwdec_api;
-+    bool hwdec_attempted = false;
-     for (int i = 0; hwdec_api && hwdec_api[i]; i++) {
-         bstr opt = bstr0(hwdec_api[i]);
- 
-         bool hwdec_requested = !bstr_equals0(opt, "no");
-+        hwdec_attempted |= hwdec_requested;
-         bool hwdec_auto_safe = bstr_equals0(opt, "auto") ||
-                             bstr_equals0(opt, "auto-safe") ||
-                             bstr_equals0(opt, "auto-copy") ||
-@@ -545,6 +547,35 @@ static void select_and_set_hwdec(struct mp_filter *vd)
-                 if (!hwdec_auto && !(bstr_equals0(opt, hwdec->method_name) ||
-                                     bstr_equals0(opt, hwdec->name)))
-                     continue;
-+
-+                /*
-+                 * Dolby Vision: the Surface-based mediacodec output is turned
-+                 * into RGB by the driver before mpv can color-manage it, so the
-+                 * Dolby Vision shader (which needs the raw IPTPQc2-coded
-+                 * planes) can never work on it. Redirect to the -copy variant:
-+                 * decoding is still done by the hardware codec, but we receive
-+                 * the raw planes in system memory.
-+                 */
-+                if (ctx->codec->dovi && !hwdec->copying &&
-+                    strcmp(hwdec->method_name, "mediacodec") == 0)
-+                {
-+                    struct hwdec_info *copy = NULL;
-+                    for (int k = 0; k < num_hwdecs; k++) {
-+                        if (hwdecs[k].copying &&
-+                            hwdecs[k].codec->id == hwdec->codec->id &&
-+                            strcmp(hwdecs[k].method_name, "mediacodec-copy") == 0)
-+                        {
-+                            copy = &hwdecs[k];
-+                            break;
-+                        }
-+                    }
-+                    if (copy) {
-+                        MP_INFO(vd, "Dolby Vision stream: forcing %s so the "
-+                                "Dolby Vision shader gets the raw samples.\n",
-+                                copy->method_name);
-+                        hwdec = copy;
-+                    }
-+                }
-                 hwdec_name_supported = true;
- 
-                 bool already_attempted = false;
-@@ -646,6 +677,10 @@ static void select_and_set_hwdec(struct mp_filter *vd)
-             MP_WARN(ctx, "Software decoding fallback is disabled.\n");
-             ctx->force_eof = true;
-         } else {
-+            if (hwdec_attempted && ctx->codec->dovi)
-+                MP_WARN(vd, "Dolby Vision stream: hardware decoding unavailable, "
-+                        "using software decoding (colors stay correct, performance "
-+                        "is lower).\n");
-             MP_VERBOSE(vd, "Using software decoding.\n");
-         }
-     }
 diff --git a/video/out/gpu/video.c b/video/out/gpu/video.c
 index 656c11c..cae56e4 100644
 --- a/video/out/gpu/video.c
@@ -143,242 +79,538 @@ index 656c11c..cae56e4 100644
          uninit_video(p);
          p->real_image_params = *params;
 diff --git a/video/out/hwdec/hwdec_aimagereader.c b/video/out/hwdec/hwdec_aimagereader.c
-index 83c2ea8..9193253 100644
+index 83c2ea8..c12a965 100644
 --- a/video/out/hwdec/hwdec_aimagereader.c
 +++ b/video/out/hwdec/hwdec_aimagereader.c
-@@ -20,6 +20,7 @@
- #include <assert.h>
- #include <dlfcn.h>
- #include <EGL/egl.h>
-+#include <android/hardware_buffer.h>
- #include <media/NdkImageReader.h>
- #include <android/native_window_jni.h>
- #include <libavcodec/mediacodec.h>
-@@ -27,6 +28,8 @@
- #include <libavutil/hwcontext_mediacodec.h>
+@@ -42,6 +42,18 @@ struct priv_owner {
+     jobject surface;
+     void *lib_handle;
  
- #include "misc/jni.h"
-+#include "common/common.h"
-+#include "mpv_talloc.h"
- #include "osdep/threads.h"
- #include "osdep/timer.h"
- #include "video/out/gpu/hwdec.h"
-@@ -51,7 +54,14 @@ struct priv_owner {
-     media_status_t (*AImageReader_acquireLatestImage)(AImageReader *, AImage **);
-     void (*AImageReader_delete)(AImageReader *);
-     media_status_t (*AImage_getHardwareBuffer)(const AImage *, AHardwareBuffer **);
-+    media_status_t (*AImage_getPlaneData)(const AImage *, int, uint8_t **, int *);
-+    media_status_t (*AImage_getPlaneRowStride)(const AImage *, int, int *);
-+    media_status_t (*AImage_getPlanePixelStride)(const AImage *, int, int *);
-+    media_status_t (*AImage_getWidth)(const AImage *, int32_t *);
-+    media_status_t (*AImage_getHeight)(const AImage *, int32_t *);
-     void (*AImage_delete)(AImage *);
-+    int (*AHardwareBuffer_lock)(AHardwareBuffer *, uint64_t, int32_t, void **);
-+    int (*AHardwareBuffer_unlock)(AHardwareBuffer *, int32_t *);
-     void (*AHardwareBuffer_describe)(const AHardwareBuffer *, AHardwareBuffer_Desc *);
-     jobject (*ANativeWindow_toSurface)(JNIEnv *, ANativeWindow *);
- };
-@@ -66,6 +76,12 @@ struct priv {
++    /* SurfaceTexture-based surface (A2 experiment) */
++    GLuint gl_texture;
++    jobject surface_texture;
++    jclass st_class;
++    jclass surface_class;
++    jmethodID st_init;
++    jmethodID st_attach;
++    jmethodID st_update;
++    jmethodID st_detach;
++    jmethodID st_set_default_size;
++    jmethodID surface_init;
++
+     media_status_t (*AImageReader_newWithUsage)(
+         int32_t, int32_t, int32_t, uint64_t, int32_t, AImageReader **);
+     media_status_t (*AImageReader_getWindow)(
+@@ -63,6 +75,15 @@ struct priv {
+     AImage *image;
+     EGLImageKHR egl_image;
+ 
++    /* Dolby Vision: recovered IPT-coded YUV planes (inverse of the driver's
++     * BT.601 full-range conversion with U/V swap), fed to the DV shader. */
++    bool dovi;
++    int tex_w, tex_h;
++    GLuint y_tex, u_tex, v_tex;
++    GLuint y_fbo, uv_fbo, vao;
++    struct ra_tex *y_ra, *u_ra, *v_ra;
++    GLuint prog_y, prog_u, prog_v;
++
      mp_mutex lock;
      mp_cond cond;
      bool image_available;
-+    bool readback;
-+    uint8_t *readback_buf;
-+    int readback_buf_size;
-+    AHardwareBuffer *locked_hwbuf;
-+    uint8_t *locked_base;
-+    AHardwareBuffer_Desc locked_desc;
- 
-     EGLImageKHR (EGLAPIENTRY *CreateImageKHR)(
-         EGLDisplay, EGLContext, EGLenum, EGLClientBuffer, const EGLint *);
-@@ -82,7 +98,14 @@ static const struct { const char *symbol; int offset; } lib_functions[] = {
-     { "AImageReader_acquireLatestImage", offsetof(struct priv_owner, AImageReader_acquireLatestImage) },
-     { "AImageReader_delete", offsetof(struct priv_owner, AImageReader_delete) },
-     { "AImage_getHardwareBuffer", offsetof(struct priv_owner, AImage_getHardwareBuffer) },
-+    { "AImage_getPlaneData", offsetof(struct priv_owner, AImage_getPlaneData) },
-+    { "AImage_getPlaneRowStride", offsetof(struct priv_owner, AImage_getPlaneRowStride) },
-+    { "AImage_getPlanePixelStride", offsetof(struct priv_owner, AImage_getPlanePixelStride) },
-+    { "AImage_getWidth", offsetof(struct priv_owner, AImage_getWidth) },
-+    { "AImage_getHeight", offsetof(struct priv_owner, AImage_getHeight) },
-     { "AImage_delete", offsetof(struct priv_owner, AImage_delete) },
-+    { "AHardwareBuffer_lock", offsetof(struct priv_owner, AHardwareBuffer_lock) },
-+    { "AHardwareBuffer_unlock", offsetof(struct priv_owner, AHardwareBuffer_unlock) },
-     { "AHardwareBuffer_describe", offsetof(struct priv_owner, AHardwareBuffer_describe) },
-     { "ANativeWindow_toSurface", offsetof(struct priv_owner, ANativeWindow_toSurface) },
-     { NULL, 0 },
-@@ -153,9 +176,13 @@ static int init(struct ra_hwdec *hw)
+@@ -153,27 +174,54 @@ static int init(struct ra_hwdec *hw)
      else
          hw->glsl_extensions = es2_exts;
  
 -    // dummy dimensions, AImageReader only transports hardware buffers
-+    // dummy dimensions; the decoder's own output format drives the buffers.
-+    // Keep the PRIVATE format: several hardware decoders (e.g. HiSilicon)
-+    // refuse to start on a YUV_420_888 surface. Dolby Vision frames are
-+    // read back with AHardwareBuffer_lock() instead.
-     media_status_t ret = p->AImageReader_newWithUsage(16, 16,
+-    media_status_t ret = p->AImageReader_newWithUsage(16, 16,
 -        AIMAGE_FORMAT_PRIVATE, AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE,
-+        AIMAGE_FORMAT_PRIVATE,
-+        AHARDWAREBUFFER_USAGE_CPU_READ_RARELY | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE,
-         5, &p->reader);
-     if (ret != AMEDIA_OK) {
-         MP_ERR(hw, "newWithUsage failed: %d\n", ret);
-@@ -254,9 +281,39 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
-     o->AImageReader_setImageListener(o->reader, &listener);
+-        5, &p->reader);
+-    if (ret != AMEDIA_OK) {
+-        MP_ERR(hw, "newWithUsage failed: %d\n", ret);
++    /* A2 experiment: use a SurfaceTexture as the decoder surface instead of
++     * an AImageReader. Some hardware decoders (e.g. HiSilicon) refuse to
++     * start on ImageReader surfaces but accept SurfaceTexture surfaces. */
++    p->st_class = (*env)->NewGlobalRef(env,
++        (*env)->FindClass(env, "android/graphics/SurfaceTexture"));
++    p->surface_class = (*env)->NewGlobalRef(env,
++        (*env)->FindClass(env, "android/view/Surface"));
++    if (!p->st_class || !p->surface_class) {
++        MP_ERR(hw, "SurfaceTexture/Surface class not found\n");
+         return -1;
+     }
+-    mp_assert(p->reader);
++    p->st_init = (*env)->GetMethodID(env, p->st_class, "<init>", "(I)V");
++    p->st_attach = (*env)->GetMethodID(env, p->st_class,
++                                       "attachToGLContext", "(I)V");
++    p->st_update = (*env)->GetMethodID(env, p->st_class,
++                                       "updateTexImage", "()V");
++    p->st_detach = (*env)->GetMethodID(env, p->st_class,
++                                       "detachFromGLContext", "()V");
++    p->st_set_default_size = (*env)->GetMethodID(env, p->st_class,
++                                       "setDefaultBufferSize", "(II)V");
++    p->surface_init = (*env)->GetMethodID(env, p->surface_class, "<init>",
++                                          "(Landroid/graphics/SurfaceTexture;)V");
++
++    /* Create the external texture now: the GL context is current on this
++     * thread (VO init), and constructing SurfaceTexture(texName) binds it to
++     * this context directly, avoiding attachToGLContext (which fails on a
++     * second mapper init with "already attached"). */
++    gl->GenTextures(1, &p->gl_texture);
++    gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, p->gl_texture);
++    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
  
-     mapper->dst_params = mapper->src_params;
--    mapper->dst_params.imgfmt = IMGFMT_RGB0;
-     mapper->dst_params.hw_subfmt = 0;
+-    ANativeWindow *window;
+-    ret = p->AImageReader_getWindow(p->reader, &window);
+-    if (ret != AMEDIA_OK) {
+-        MP_ERR(hw, "getWindow failed: %d\n", ret);
++    jobject st = (*env)->NewObject(env, p->st_class, p->st_init,
++                                   (jint)p->gl_texture);
++    p->surface_texture = (*env)->NewGlobalRef(env, st);
++    (*env)->DeleteLocalRef(env, st);
++    jobject sf = (*env)->NewObject(env, p->surface_class, p->surface_init,
++                                   p->surface_texture);
++    p->surface = (*env)->NewGlobalRef(env, sf);
++    (*env)->DeleteLocalRef(env, sf);
++    if (MP_JNI_EXCEPTION_CHECK()) {
++        MP_ERR(hw, "SurfaceTexture creation failed\n");
+         return -1;
+     }
+-    mp_assert(window);
+-
+-    jobject surface = p->ANativeWindow_toSurface(env, window);
+-    p->surface = (*env)->NewGlobalRef(env, surface);
+-    (*env)->DeleteLocalRef(env, surface);
++    MP_INFO(hw, "A2: using SurfaceTexture as decoder surface\n");
  
-+    // Dolby Vision needs the raw IPTPQc2-coded planes for libplacebo's DV
-+    // shader, so read them back from the AImage instead of using the EGL
-+    // external texture (which hands the driver-converted RGB to the shader).
-+    p->readback = mapper->src_params.repr.dovi ||
-+                  mapper->src_params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION;
-+    if (p->readback) {
-+        mapper->dst_params.imgfmt = IMGFMT_NV12;
-+        struct ra_tex_params tparams = {
-+            .dimensions = 2,
-+            .w = mapper->src_params.w,
-+            .h = mapper->src_params.h,
-+            .d = 1,
-+            .render_src = true,
-+            .format = ra_find_unorm_format(mapper->ra, 1, 1), // R8 luma
-+        };
-+        if (!tparams.format || tparams.format->ctype != RA_CTYPE_UNORM)
-+            return -1;
-+        mapper->tex[0] = ra_tex_create(mapper->ra, &tparams);
-+        tparams.w = (mapper->src_params.w + 1) / 2;
-+        tparams.h = (mapper->src_params.h + 1) / 2;
-+        tparams.format = ra_find_unorm_format(mapper->ra, 1, 2); // RG8 chroma
-+        if (!tparams.format || tparams.format->ctype != RA_CTYPE_UNORM)
-+            return -1;
-+        mapper->tex[1] = ra_tex_create(mapper->ra, &tparams);
-+        if (!mapper->tex[0] || !mapper->tex[1])
-+            return -1;
+     p->hwctx = (struct mp_hwdec_ctx) {
+         .driver_name = hw->driver->name,
+@@ -195,17 +243,25 @@ static void uninit(struct ra_hwdec *hw)
+ {
+     struct priv_owner *p = hw->priv;
+ 
++    JNIEnv *env = MP_JNI_GET_ENV(hw);
++    if (p->gl_texture) {
++        GL *gl = ra_gl_get(hw->ra_ctx->ra);
++        gl->DeleteTextures(1, &p->gl_texture);
++        p->gl_texture = 0;
++    }
+     if (p->surface) {
+-        JNIEnv *env = MP_JNI_GET_ENV(hw);
+         mp_assert(env);
+         (*env)->DeleteGlobalRef(env, p->surface);
+         p->surface = NULL;
+     }
+-
+-    if (p->reader) {
+-        p->AImageReader_delete(p->reader);
+-        p->reader = NULL;
++    if (p->surface_texture) {
++        (*env)->DeleteGlobalRef(env, p->surface_texture);
++        p->surface_texture = NULL;
+     }
++    if (p->st_class)
++        (*env)->DeleteGlobalRef(env, p->st_class);
++    if (p->surface_class)
++        (*env)->DeleteGlobalRef(env, p->surface_class);
+ 
+     hwdec_devices_remove(hw->devs, &p->hwctx);
+     av_buffer_unref(&p->hwctx.av_device_ref);
+@@ -216,21 +272,94 @@ static void uninit(struct ra_hwdec *hw)
+     }
+ }
+ 
+-static void image_callback(void *context, AImageReader *reader)
++// Compile an ES 3.0 program with the given vertex/fragment source.
++static GLuint dv_link_program(GL *gl, struct mp_log *log, const char *vsrc,
++                              const char *fsrc, const char *name)
+ {
+-    struct priv *p = context;
++    GLuint vs = gl->CreateShader(GL_VERTEX_SHADER);
++    gl->ShaderSource(vs, 1, &vsrc, NULL);
++    gl->CompileShader(vs);
++    GLint ok = 0;
++    gl->GetShaderiv(vs, GL_COMPILE_STATUS, &ok);
++    if (!ok) {
++        mp_info(log, "A2: %s vertex shader compile failed\n", name);
++        gl->DeleteShader(vs);
 +        return 0;
 +    }
++    GLuint fs = gl->CreateShader(GL_FRAGMENT_SHADER);
++    gl->ShaderSource(fs, 1, &fsrc, NULL);
++    gl->CompileShader(fs);
++    gl->GetShaderiv(fs, GL_COMPILE_STATUS, &ok);
++    if (!ok) {
++        mp_info(log, "A2: %s fragment shader compile failed\n", name);
++        gl->DeleteShader(vs);
++        gl->DeleteShader(fs);
++        return 0;
++    }
++    GLuint prog = gl->CreateProgram();
++    gl->AttachShader(prog, vs);
++    gl->AttachShader(prog, fs);
++    gl->LinkProgram(prog);
++    gl->GetProgramiv(prog, GL_LINK_STATUS, &ok);
++    gl->DeleteShader(vs);
++    gl->DeleteShader(fs);
++    if (!ok) {
++        mp_info(log, "A2: %s program link failed\n", name);
++        gl->DeleteProgram(prog);
++        return 0;
++    }
++    return prog;
++}
 +
-+    mapper->dst_params.imgfmt = IMGFMT_RGB0;
-+
-     // texture creation
-     gl->GenTextures(1, &p->gl_texture);
-     gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, p->gl_texture);
-@@ -291,14 +348,21 @@ static void mapper_uninit(struct ra_hwdec_mapper *mapper)
++// Create an R8 renderable texture.
++static bool dv_make_r8_tex(GL *gl, int w, int h, GLuint *tex)
++{
++    gl->GenTextures(1, tex);
++    gl->BindTexture(GL_TEXTURE_2D, *tex);
++    gl->TexImage2D(GL_TEXTURE_2D, 0, GL_R8, w, h, 0, GL_RED,
++                   GL_UNSIGNED_BYTE, NULL);
++    gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++    gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++    gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++    gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    gl->BindTexture(GL_TEXTURE_2D, 0);
++    return true;
++}
+ 
+-    mp_mutex_lock(&p->lock);
+-    p->image_available = true;
+-    mp_cond_signal(&p->cond);
+-    mp_mutex_unlock(&p->lock);
++// Render the inverse-conversion shader from the external RGB texture into a
++// target texture via an FBO.
++static void dv_render_planes(GL *gl, GLuint fbo, GLuint dst_tex, int w, int h,
++                             GLuint prog, GLuint src_tex, int sw, int sh,
++                             GLuint vao)
++{
++    GLint old_viewport[4];
++    gl->GetIntegerv(GL_VIEWPORT, old_viewport);
++    gl->BindVertexArray(vao);
++    gl->BindFramebuffer(GL_FRAMEBUFFER, fbo);
++    gl->FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++                             GL_TEXTURE_2D, dst_tex, 0);
++    gl->Viewport(0, 0, w, h);
++    gl->UseProgram(prog);
++    gl->ActiveTexture(GL_TEXTURE0);
++    gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, src_tex);
++    GLint loc = gl->GetUniformLocation(prog, "tex");
++    if (loc >= 0)
++        gl->Uniform1i(loc, 0);
++    loc = gl->GetUniformLocation(prog, "tex_size");
++    if (loc >= 0)
++        gl->Uniform2f(loc, sw, sh);
++    gl->DrawArrays(GL_TRIANGLES, 0, 3);
++    gl->BindFramebuffer(GL_FRAMEBUFFER, 0);
++    gl->UseProgram(0);
++    gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
++    gl->BindVertexArray(0);
++    gl->Viewport(old_viewport[0], old_viewport[1], old_viewport[2], old_viewport[3]);
+ }
+ 
+ static int mapper_init(struct ra_hwdec_mapper *mapper)
  {
      struct priv *p = mapper->priv;
      struct priv_owner *o = mapper->owner->priv;
 -    GL *gl = ra_gl_get(mapper->ra);
  
-     o->AImageReader_setImageListener(o->reader, NULL);
+     p->log = mapper->log;
+     mp_mutex_init(&p->lock);
+@@ -247,42 +376,153 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
+         !p->GetNativeClientBufferANDROID || !p->EGLImageTargetTexture2DOES)
+         return -1;
  
--    gl->DeleteTextures(1, &p->gl_texture);
--    p->gl_texture = 0;
+-    AImageReader_ImageListener listener = {
+-        .context = p,
+-        .onImageAvailable = image_callback,
+-    };
+-    o->AImageReader_setImageListener(o->reader, &listener);
 -
--    ra_tex_free(mapper->ra, &mapper->tex[0]);
-+    if (p->readback) {
-+        ra_tex_free(mapper->ra, &mapper->tex[0]);
-+        ra_tex_free(mapper->ra, &mapper->tex[1]);
-+        talloc_free(p->readback_buf);
-+        p->readback_buf = NULL;
-+        p->readback_buf_size = 0;
-+    } else {
-+        GL *gl = ra_gl_get(mapper->ra);
-+        gl->DeleteTextures(1, &p->gl_texture);
-+        p->gl_texture = 0;
-+        ra_tex_free(mapper->ra, &mapper->tex[0]);
-+    }
+     mapper->dst_params = mapper->src_params;
+-    mapper->dst_params.imgfmt = IMGFMT_RGB0;
+     mapper->dst_params.hw_subfmt = 0;
  
-     mp_mutex_destroy(&p->lock);
-     mp_cond_destroy(&p->cond);
-@@ -309,11 +373,17 @@ static void mapper_unmap(struct ra_hwdec_mapper *mapper)
-     struct priv *p = mapper->priv;
-     struct priv_owner *o = mapper->owner->priv;
- 
--    if (p->egl_image) {
-+    if (!p->readback && p->egl_image) {
-         p->DestroyImageKHR(eglGetCurrentDisplay(), p->egl_image);
-         p->egl_image = 0;
-     }
- 
-+    if (p->readback && p->locked_hwbuf) {
-+        o->AHardwareBuffer_unlock(p->locked_hwbuf, NULL);
-+        p->locked_hwbuf = NULL;
-+        p->locked_base = NULL;
-+    }
+-    // texture creation
+-    gl->GenTextures(1, &p->gl_texture);
+-    gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, p->gl_texture);
+-    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+-    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+-    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+-    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+-    gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
++    // The SurfaceTexture was constructed with this texture id at hwdec init
++    // (SurfaceTexture(texName)), so the mapper must wrap the SAME texture.
++    // attachToGLContext must NOT be called again ("already attached").
++    p->gl_texture = o->gl_texture;
++    if (!p->gl_texture)
++        return -1;
 +
-     if (p->image) {
-         o->AImage_delete(p->image);
-         p->image = NULL;
-@@ -353,6 +423,69 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
-     }
-     mp_assert(p->image);
- 
-+    if (p->readback) {
-+        // PRIVATE decoder buffers (e.g. HiSilicon) expose their underlying
-+        // NV12 planes through AHardwareBuffer_lock().
-+        AHardwareBuffer *hwbuf = NULL;
-+        uint8_t *base = NULL;
-+        AHardwareBuffer_Desc d;
++    int w = mapper->src_params.w;
++    int h = mapper->src_params.h;
++    bool dovi = mapper->src_params.repr.dovi != NULL ||
++                mapper->src_params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION;
++    p->dovi = dovi && w >= 2 && h >= 2;
 +
-+        if (o->AImage_getHardwareBuffer(p->image, &hwbuf) != AMEDIA_OK || !hwbuf) {
-+            MP_ERR(mapper, "getHardwareBuffer failed\n");
++    if (!p->dovi) {
++        mapper->dst_params.imgfmt = IMGFMT_RGB0;
++        struct ra_tex_params params = {
++            .dimensions = 2,
++            .w = w,
++            .h = h,
++            .d = 1,
++            .format = ra_find_unorm_format(mapper->ra, 1, 4),
++            .render_src = true,
++            .src_linear = true,
++            .external_oes = true,
++        };
++        if (params.format->ctype != RA_CTYPE_UNORM)
 +            return -1;
-+        }
-+        o->AHardwareBuffer_describe(hwbuf, &d);
-+        if (o->AHardwareBuffer_lock(hwbuf, AHARDWAREBUFFER_USAGE_CPU_READ_RARELY,
-+                                    -1, (void **)&base) != 0 || !base) {
-+            MP_ERR(mapper, "AHardwareBuffer_lock failed for DV readback\n");
-+            return -1;
-+        }
-+
-+        int iw = d.width, ih = d.height;
-+        if (iw <= 0 || ih <= 0) {
-+            o->AHardwareBuffer_unlock(hwbuf, NULL);
-+            return -1;
-+        }
-+
-+        // The coded size may differ from the first format report.
-+        if (mapper->tex[0]->params.w != iw || mapper->tex[0]->params.h != ih) {
-+            ra_tex_free(mapper->ra, &mapper->tex[0]);
-+            ra_tex_free(mapper->ra, &mapper->tex[1]);
-+            struct ra_tex_params tp = {
-+                .dimensions = 2, .w = iw, .h = ih, .d = 1, .render_src = true,
-+                .format = ra_find_unorm_format(mapper->ra, 1, 1),
-+            };
-+            mapper->tex[0] = ra_tex_create(mapper->ra, &tp);
-+            tp.w = (iw + 1) / 2;
-+            tp.h = (ih + 1) / 2;
-+            tp.format = ra_find_unorm_format(mapper->ra, 1, 2);
-+            mapper->tex[1] = ra_tex_create(mapper->ra, &tp);
-+            if (!mapper->tex[0] || !mapper->tex[1]) {
-+                o->AHardwareBuffer_unlock(hwbuf, NULL);
-+                return -1;
-+            }
-+        }
-+
-+        p->locked_hwbuf = hwbuf;
-+        p->locked_base = base;
-+        p->locked_desc = d;
-+
-+        struct mp_rect yrc = {0, 0, iw, ih};
-+        if (!mapper->ra->fns->tex_upload(mapper->ra, &(struct ra_tex_upload_params){
-+                .tex = mapper->tex[0], .src = base, .stride = d.stride, .rc = &yrc}))
-+            return -1;
-+
-+        // NV12: chroma plane starts right after the luma plane.
-+        int cw = (iw + 1) / 2, ch = (ih + 1) / 2;
-+        struct mp_rect uvrc = {0, 0, cw, ch};
-+        if (!mapper->ra->fns->tex_upload(mapper->ra, &(struct ra_tex_upload_params){
-+                .tex = mapper->tex[1],
-+                .src = base + (ptrdiff_t)d.stride * d.height,
-+                .stride = d.stride, .rc = &uvrc}))
++        mapper->tex[0] = ra_create_wrapped_tex(mapper->ra, &params, p->gl_texture);
++        if (!mapper->tex[0])
 +            return -1;
 +        return 0;
 +    }
+ 
+-    struct ra_tex_params params = {
++    /* Dolby Vision: recover the IPT-coded YUV planes by inverting the
++     * driver's fixed BT.601 full-range conversion (with U/V swap, i.e. the
++     * driver uses U=V_raw, V=U_raw). The recovered planes match the
++     * swap_uv-corrected byte path, so the DV shader reproduces the same
++     * colors while staying entirely on the GPU. */
++    p->tex_w = w;
++    p->tex_h = h;
++    mapper->dst_params.imgfmt = IMGFMT_420P;
 +
-     AHardwareBuffer *hwbuf = NULL;
-     ret = o->AImage_getHardwareBuffer(p->image, &hwbuf);
-     if (ret != AMEDIA_OK) {
++    static const char *vsrc =
++        "#version 300 es\n"
++        "out vec2 v_uv;\n"
++        "void main() {\n"
++        "  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));\n"
++        "  v_uv = p;\n"
++        "  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
++        "}\n";
++
++    /* Inverse of: R=y'+1.5959*v, G=y'-0.3917*u-0.8131*v, B=y'+2.017*u
++     * with y'=(Y-16)*255/219, u=U-128, v=V-128 (full-range RGB output).
++     * y' = (G + 0.19420*B + 0.50949*R) / 1.70369
++     * Y  = y'*219/255 + 16 ; U = (B-y')/2.017 + 128 ; V = (R-y')/1.5959 + 128 */
++    static const char *fs_y =
++        "#version 300 es\n"
++        "#extension GL_OES_EGL_image_external_essl3 : enable\n"
++        "precision highp float;\n"
++        "uniform samplerExternalOES tex;\n"
++        "in vec2 v_uv;\n"
++        "out vec4 frag;\n"
++        "void main() {\n"
++        "  vec3 rgb = texture(tex, v_uv).rgb;\n"
++        "  float yp = (rgb.g + 0.19420*rgb.b + 0.50949*rgb.r) / 1.70369;\n"
++        "  frag = vec4(yp * 0.85882 + 0.06275, 0.0, 0.0, 1.0);\n"
++        "}\n";
++
++    static const char *fs_u =
++        "#version 300 es\n"
++        "#extension GL_OES_EGL_image_external_essl3 : enable\n"
++        "precision highp float;\n"
++        "uniform samplerExternalOES tex;\n"
++        "uniform vec2 tex_size;\n"
++        "in vec2 v_uv;\n"
++        "out vec4 frag;\n"
++        "void main() {\n"
++        "  vec2 cell = floor(v_uv * tex_size * 0.5) * 2.0;\n"
++        "  float s = 0.0;\n"
++        "  for (int k = 0; k < 4; k++) {\n"
++        "    vec2 o = vec2(float((k & 1) * 2), float((k >> 1) * 2));\n"
++        "    vec3 rgb = texture(tex, (cell + o + vec2(0.5)) / tex_size).rgb;\n"
++        "    float yp = (rgb.g + 0.19420*rgb.b + 0.50949*rgb.r) / 1.70369;\n"
++        "    s += (rgb.b - yp) / 2.017 + 0.50196;\n"
++        "  }\n"
++        "  frag = vec4(s * 0.25, 0.0, 0.0, 1.0);\n"
++        "}\n";
++
++    static const char *fs_v =
++        "#version 300 es\n"
++        "#extension GL_OES_EGL_image_external_essl3 : enable\n"
++        "precision highp float;\n"
++        "uniform samplerExternalOES tex;\n"
++        "uniform vec2 tex_size;\n"
++        "in vec2 v_uv;\n"
++        "out vec4 frag;\n"
++        "void main() {\n"
++        "  vec2 cell = floor(v_uv * tex_size * 0.5) * 2.0;\n"
++        "  float s = 0.0;\n"
++        "  for (int k = 0; k < 4; k++) {\n"
++        "    vec2 o = vec2(float((k & 1) * 2), float((k >> 1) * 2));\n"
++        "    vec3 rgb = texture(tex, (cell + o + vec2(0.5)) / tex_size).rgb;\n"
++        "    float yp = (rgb.g + 0.19420*rgb.b + 0.50949*rgb.r) / 1.70369;\n"
++        "    s += (rgb.r - yp) / 1.5959 + 0.50196;\n"
++        "  }\n"
++        "  frag = vec4(s * 0.25, 0.0, 0.0, 1.0);\n"
++        "}\n";
++
++    GL *gl = ra_gl_get(mapper->ra);
++    if (!dv_make_r8_tex(gl, w, h, &p->y_tex) ||
++        !dv_make_r8_tex(gl, w / 2, h / 2, &p->u_tex) ||
++        !dv_make_r8_tex(gl, w / 2, h / 2, &p->v_tex))
++        return -1;
++    gl->GenFramebuffers(1, &p->y_fbo);
++    gl->GenFramebuffers(1, &p->uv_fbo);
++    gl->GenVertexArrays(1, &p->vao);
++    p->prog_y = dv_link_program(gl, mapper->log, vsrc, fs_y, "y");
++    p->prog_u = dv_link_program(gl, mapper->log, vsrc, fs_u, "u");
++    p->prog_v = dv_link_program(gl, mapper->log, vsrc, fs_v, "v");
++    if (!p->prog_y || !p->prog_u || !p->prog_v)
++        return -1;
++
++    struct ra_tex_params yp = {
+         .dimensions = 2,
+-        .w = mapper->src_params.w,
+-        .h = mapper->src_params.h,
++        .w = w,
++        .h = h,
+         .d = 1,
+-        .format = ra_find_unorm_format(mapper->ra, 1, 4),
++        .format = ra_find_unorm_format(mapper->ra, 1, 1),
+         .render_src = true,
+         .src_linear = true,
+-        .external_oes = true,
+     };
+-
+-    if (params.format->ctype != RA_CTYPE_UNORM)
++    if (!yp.format)
+         return -1;
+-
+-    mapper->tex[0] = ra_create_wrapped_tex(mapper->ra, &params, p->gl_texture);
+-    if (!mapper->tex[0])
++    struct ra_tex_params up = yp;
++    up.w = w / 2;
++    up.h = h / 2;
++    p->y_ra = ra_create_wrapped_tex(mapper->ra, &yp, p->y_tex);
++    p->u_ra = ra_create_wrapped_tex(mapper->ra, &up, p->u_tex);
++    p->v_ra = ra_create_wrapped_tex(mapper->ra, &up, p->v_tex);
++    if (!p->y_ra || !p->u_ra || !p->v_ra)
+         return -1;
++    mapper->tex[0] = p->y_ra;
++    mapper->tex[1] = p->u_ra;
++    mapper->tex[2] = p->v_ra;
+ 
+     return 0;
+ }
+@@ -290,16 +530,35 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
+ static void mapper_uninit(struct ra_hwdec_mapper *mapper)
+ {
+     struct priv *p = mapper->priv;
+-    struct priv_owner *o = mapper->owner->priv;
+     GL *gl = ra_gl_get(mapper->ra);
+-
+-    o->AImageReader_setImageListener(o->reader, NULL);
+-
+-    gl->DeleteTextures(1, &p->gl_texture);
++    // The external GL texture is owned by the SurfaceTexture (created at
++    // hwdec init), so it must not be deleted or detached here.
+     p->gl_texture = 0;
+ 
++    ra_tex_free(mapper->ra, &p->y_ra);
++    ra_tex_free(mapper->ra, &p->u_ra);
++    ra_tex_free(mapper->ra, &p->v_ra);
+     ra_tex_free(mapper->ra, &mapper->tex[0]);
+ 
++    if (p->y_tex)
++        gl->DeleteTextures(1, &p->y_tex);
++    if (p->u_tex)
++        gl->DeleteTextures(1, &p->u_tex);
++    if (p->v_tex)
++        gl->DeleteTextures(1, &p->v_tex);
++    if (p->y_fbo)
++        gl->DeleteFramebuffers(1, &p->y_fbo);
++    if (p->uv_fbo)
++        gl->DeleteFramebuffers(1, &p->uv_fbo);
++    if (p->vao)
++        gl->DeleteVertexArrays(1, &p->vao);
++    if (p->prog_y)
++        gl->DeleteProgram(p->prog_y);
++    if (p->prog_u)
++        gl->DeleteProgram(p->prog_u);
++    if (p->prog_v)
++        gl->DeleteProgram(p->prog_v);
++
+     mp_mutex_destroy(&p->lock);
+     mp_cond_destroy(&p->cond);
+ }
+@@ -333,55 +592,23 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
+         av_mediacodec_release_buffer(buffer, 1);
+     }
+ 
+-    bool image_available = false;
+-    mp_mutex_lock(&p->lock);
+-    if (!p->image_available) {
+-        mp_cond_timedwait(&p->cond, &p->lock, MP_TIME_MS_TO_NS(100));
+-        if (!p->image_available)
+-            MP_WARN(mapper, "Waiting for frame timed out!\n");
+-    }
+-    image_available = p->image_available;
+-    p->image_available = false;
+-    mp_mutex_unlock(&p->lock);
+-
+-    media_status_t ret = o->AImageReader_acquireLatestImage(o->reader, &p->image);
+-    if (ret != AMEDIA_OK) {
+-        MP_ERR(mapper, "acquireLatestImage failed: %d\n", ret);
+-        // If we merely timed out waiting return success anyway to avoid
+-        // flashing frames of render errors.
+-        return image_available ? -1 : 0;
+-    }
+-    mp_assert(p->image);
+-
+-    AHardwareBuffer *hwbuf = NULL;
+-    ret = o->AImage_getHardwareBuffer(p->image, &hwbuf);
+-    if (ret != AMEDIA_OK) {
+-        MP_ERR(mapper, "getHardwareBuffer failed: %d\n", ret);
+-        return -1;
+-    }
+-    mp_assert(hwbuf);
+-
+-    // Update texture size since it may differ
+-    AHardwareBuffer_Desc d;
+-    o->AHardwareBuffer_describe(hwbuf, &d);
+-    if (mapper->tex[0]->params.w != d.width || mapper->tex[0]->params.h != d.height) {
+-        MP_VERBOSE(p, "Texture dimensions changed to %dx%d\n", d.width, d.height);
+-        mapper->tex[0]->params.w = d.width;
+-        mapper->tex[0]->params.h = d.height;
+-    }
+-
+-    EGLClientBuffer buf = p->GetNativeClientBufferANDROID(hwbuf);
+-    if (!buf)
++    JNIEnv *env = MP_JNI_GET_ENV(mapper);
++    if (!env)
+         return -1;
+-
+-    const int attribs[] = {EGL_NONE};
+-    p->egl_image = p->CreateImageKHR(eglGetCurrentDisplay(),
+-        EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, buf, attribs);
+-    if (!p->egl_image)
++    (*env)->CallVoidMethod(env, o->surface_texture, o->st_update);
++    if (MP_JNI_EXCEPTION_CHECK()) {
++        MP_ERR(mapper, "updateTexImage failed\n");
+         return -1;
+-
++    }
+     gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, p->gl_texture);
+-    p->EGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, p->egl_image);
++    if (p->dovi) {
++        dv_render_planes(gl, p->y_fbo, p->y_tex, p->tex_w, p->tex_h,
++                         p->prog_y, p->gl_texture, p->tex_w, p->tex_h, p->vao);
++        dv_render_planes(gl, p->uv_fbo, p->u_tex, p->tex_w / 2, p->tex_h / 2,
++                         p->prog_u, p->gl_texture, p->tex_w, p->tex_h, p->vao);
++        dv_render_planes(gl, p->uv_fbo, p->v_tex, p->tex_w / 2, p->tex_h / 2,
++                         p->prog_v, p->gl_texture, p->tex_w, p->tex_h, p->vao);
++    }
+     gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+ 
+     return 0;
 diff --git a/video/out/vo.c b/video/out/vo.c
 index f93f6cf..6f9bac2 100644
 --- a/video/out/vo.c
