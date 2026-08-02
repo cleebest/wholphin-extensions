@@ -103,6 +103,10 @@ jobs:
         shell: bash
         run: |
           ./gradlew assembleRelease assembleDebug
+      - name: Build testapp APK
+        shell: bash
+        run: |
+          ./gradlew :testapp:assembleRelease
       - name: Publish aar
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -118,6 +122,18 @@ jobs:
             wholphin-media3/libs/*.aar
             wholphin-mpv/build/outputs/aar/*.aar
           compression-level: 0
+      - name: Upload testapp APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: wholphin-testapp-apk
+          path: testapp/build/outputs/apk/release/testapp-release.apk
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}"             testapp/build/outputs/apk/release/testapp-release.apk             wholphin-mpv/build/outputs/aar/*/wholphin-mpv-release.aar             --repo "${{ github.repository }}"             --title "Wholphin DV build ${{ github.ref_name }}"             --generate-notes || true
       - name: Save libmpv module cache
         id: cache_libmpv_module_save
         uses: actions/cache/save@v5
