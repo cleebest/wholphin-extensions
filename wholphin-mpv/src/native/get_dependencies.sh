@@ -60,7 +60,8 @@ clone "https://gitlab.freedesktop.org/freetype/freetype.git" "VER-2-14-1" freety
 
 clone "https://github.com/libass/libass" "0.17.4" libass
 
-clone "https://github.com/haasn/libplacebo" "v7.371.0" libplacebo --recurse-submodules
+# v7.371.0 is a version number, not a tag; master satisfies mpv >=7.360.1
+clone "https://github.com/haasn/libplacebo" "master" libplacebo --recurse-submodules
 
 clone "${MPV_REPO_URL:-https://github.com/cleebest/mpv}" "${MPV_REPO_BRANCH:-wholphin-dovi}" mpv
 # Apply local patches for Dolby Vision (mediacodec-copy + gpu-next).
